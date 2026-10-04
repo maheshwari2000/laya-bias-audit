@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this code or data, please cite the paper."
+title: "Order, Keys, and Yes/No: Auditing Option Bias in a Non-Autoregressive Decision Model"
+authors:
+  - family-names: Maheshwari
+    given-names: Sagar
+    email: maheshwari.sagars2000@gmail.com
+repository-code: "https://github.com/maheshwari2000/laya-bias-audit"
+license: MIT
+date-released: 2026-10-04
