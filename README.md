@@ -18,7 +18,7 @@ Code, raw model outputs and figures for the paper by **Sagar Maheshwari** (Indep
 ## Repository layout
 
 ```
-laya_audit_full.py   # runs every experiment on both checkpoints; caches raw outputs; prints tables; draws figures
+laya_audit_full.py   # runs every experiment (or, if outputs are cached, only the analysis); prints tables; draws figures
 paired_stats.py      # paired McNemar + bootstrap tests with Holm correction, from cached outputs (no GPU needed)
 results/             # raw outputs (JSONL), results_summary.json, paired_stats.{md,json}
 figures/             # the three figures in the paper
@@ -27,21 +27,24 @@ paper/               # compiled paper (PDF)
 
 ## Reproducing
 
-**Full run (GPU, ~25 min on one T4).** On Kaggle: enable *GPU T4 x2* and *Internet*, then
+**1. Check the numbers without a GPU (seconds to a minute).** The repository ships every raw model output, so all tables and figures can be recomputed on a laptop:
+
+```bash
+pip install numpy scipy scikit-learn matplotlib tqdm
+python laya_audit_full.py      # finds the cached outputs in results/ and only re-runs the analysis
+python paired_stats.py results # paired McNemar / bootstrap tests with Holm correction
+```
+
+**2. Re-run the model from scratch (GPU, ~25 min on one T4).** Move or delete the `*.jsonl` files in `results/` (or point `LAYA_AUDIT_OUT` to an empty folder), then:
 
 ```bash
 pip install -r requirements.txt
-python laya_audit_full.py        # writes /kaggle/working/laya_audit/
+LAYA_AUDIT_OUT=my_run python laya_audit_full.py
 ```
 
-Raw outputs are cached, so an interrupted run resumes where it stopped. The script disables Laya's 4-decimal output rounding (display only; model computation is unchanged) because some findings concern probabilities below 1e-4. Results in the paper use **laya 0.3.22**; newer releases or retrained checkpoints may differ.
+On Kaggle, enable *GPU T4 x2* and *Internet*; the script then writes to `/kaggle/working/laya_audit` by default. Each experiment is cached as it finishes, so an interrupted run resumes where it stopped. The script disables Laya's 4-decimal output rounding (display only; model computation is unchanged), because some findings concern probabilities below 1e-4.
 
-**Statistics only (CPU, seconds).** Recompute the paired tests from the included raw outputs:
-
-```bash
-pip install numpy scipy scikit-learn
-python paired_stats.py results
-```
+**Environment used for the paper:** laya 0.3.22, transformers 5.0.0, PyTorch 2.10.0, datasets 5.0.0, one NVIDIA Tesla T4. Newer laya releases or retrained checkpoints may give different numbers.
 
 ## Data format
 

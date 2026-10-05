@@ -1,19 +1,21 @@
 # =============================================================================
 # Laya bias audit: full end-to-end run (both checkpoints, all experiments)
+# Paper: "Order, Keys, and Yes/No: Auditing Option Bias in a Non-Autoregressive
+#         Decision Model" (Sagar Maheshwari, 2026)
 # =============================================================================
-# How to run on Kaggle:
-#   1. Settings: Accelerator = GPU T4 x2, Internet = On.
-#   2. Cell 1:  !pip install -q laya datasets
-#   3. Cell 2:  paste this whole file and run it.
-#   Recommended: "Save Version" -> "Save & Run All" so it runs in the background
-#   (~30-45 minutes, ~35,000 model calls).
+# Two modes, chosen automatically:
+#   * Full run (GPU): any cached result file is missing -> the model is loaded and the
+#     missing experiments are run (~35,000 calls, ~25 min on one T4). Every experiment
+#     is cached as JSONL, so an interrupted run resumes where it stopped.
+#   * Analysis only (CPU): all result files already exist (e.g. the ones shipped in
+#     results/) -> no model or GPU is needed; tables and figures are recomputed.
 #
-#   Every experiment caches its raw results in /kaggle/working/laya_audit/.
-#   If the session dies, just run again: finished experiments load from disk.
-#   Delete that folder to force a completely fresh run.
+# Output directory: $LAYA_AUDIT_OUT if set; otherwise /kaggle/working/laya_audit on
+# Kaggle, else ./results.
 #
-#   When it finishes, copy EVERYTHING printed after "BEGIN RESULTS" and paste it back.
-#   Figures are saved in /kaggle/working/laya_audit/figures/.
+# On Kaggle: Settings -> Accelerator "GPU T4 x2", Internet on; then
+#   !pip install -q laya==0.3.22 datasets
+#   !python laya_audit_full.py
 # =============================================================================
 
 import os
@@ -22,9 +24,7 @@ os.environ["USE_TF"] = "0"          # Kaggle ships TensorFlow; this avoids a mod
 import builtins, json, time, itertools
 import importlib.metadata as im
 import numpy as np
-import torch
 from tqdm.auto import tqdm
-from datasets import load_dataset
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from scipy.stats import chisquare
@@ -32,29 +32,18 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ---- Disable Laya's 4-decimal output rounding (research use; integer rounding kept intact) ----
-def _no_round(x, n=None):
-    return builtins.round(x) if n is None else x
-
-import laya.agent as _la
-_la.round = _no_round
-try:
-    import laya.onnx_agent as _lo
-    _lo.round = _no_round
-except Exception:
-    pass
-from laya import Router
-
 # ============================== configuration ==============================
 SEED = 0
 N_BOOT = 1000
 EPS = 1e-15
 CHECKPOINTS = ["english", "multilingual"]
-OUT = "/kaggle/working/laya_audit"
+OUT = os.environ.get("LAYA_AUDIT_OUT") or (
+    "/kaggle/working/laya_audit" if os.path.isdir("/kaggle/working") else "results")
 FIG = f"{OUT}/figures"
 os.makedirs(FIG, exist_ok=True)
 
 N_AG, N_EMO, N_BOOLQ = 200, 300, 800   # SST-2 uses its full validation set (872)
+N_SST = 872
 N_EMO_PERMS = 6
 N_CALIB = 200
 RANDOM_KEYS = ["qzv", "lmt", "wkr", "pfy", "dxo", "bnu"]
@@ -67,26 +56,52 @@ def _ver(pkg):
     except Exception:
         return "unknown"
 
-ENV = {
-    "laya": _ver("laya"), "transformers": _ver("transformers"), "torch": torch.__version__,
-    "datasets": _ver("datasets"), "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
-}
+# Environment and rounding-patch status are recorded when the model is actually run;
+# in analysis-only mode they are read back from the previous run's summary.
+ENV, PATCH_OK = None, None
+_prev = f"{OUT}/results_summary.json"
+if os.path.exists(_prev):
+    with open(_prev) as f:
+        _p = json.load(f)
+    ENV, PATCH_OK = _p.get("env"), _p.get("rounding_patch_active")
 
-router = Router(preload=True, device="cuda" if torch.cuda.is_available() else "cpu")
+# ============================== model (loaded lazily) ==============================
+_router = None
 
-# ============================== model helpers ==============================
+def _no_round(x, n=None):
+    # Laya rounds returned probabilities to 4 decimals; keep full precision for measurement.
+    # Integer rounding (n is None) is unchanged. This affects reporting only, not the model.
+    return builtins.round(x) if n is None else x
+
+def get_router():
+    global _router, ENV, PATCH_OK
+    if _router is None:
+        import torch
+        import laya.agent as _la
+        _la.round = _no_round
+        try:
+            import laya.onnx_agent as _lo
+            _lo.round = _no_round
+        except Exception:
+            pass
+        from laya import Router
+        _router = Router(preload=True, device="cuda" if torch.cuda.is_available() else "cpu")
+        ENV = {"laya": _ver("laya"), "transformers": _ver("transformers"), "torch": torch.__version__,
+               "datasets": _ver("datasets"),
+               "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"}
+        _, probe = ask_choice("The update broke everything.", {"positive": "happy", "negative": "angry"},
+                              "What is the sentiment?", "english")
+        PATCH_OK = max(len(repr(v).split(".")[-1]) for v in probe.values()) > 4
+    return _router
+
 def ask_choice(text, criteria, instructions, ckpt):
     q = {"q": {"type": "choice", "instructions": instructions, "criteria": criteria}}
-    a = router.predict(text, q, model=ckpt)["answers"]["q"]
+    a = get_router().predict(text, q, model=ckpt)["answers"]["q"]
     return a["choice"], {k: float(v) for k, v in a["probabilities"].items()}
 
 def ask_noul(text, instructions, ckpt):
     q = {"q": {"type": "noul", "instructions": instructions}}
-    return float(router.predict(text, q, model=ckpt)["answers"]["q"]["noul"])
-
-_, _probe = ask_choice("The update broke everything.", {"positive": "happy", "negative": "angry"},
-                       "What is the sentiment?", "english")
-PATCH_OK = max(len(repr(v).split(".")[-1]) for v in _probe.values()) > 4
+    return float(get_router().predict(text, q, model=ckpt)["answers"]["q"]["noul"])
 
 def cached(name, fn):
     """Run fn() once and store its records as JSONL; reload on later runs."""
@@ -185,22 +200,30 @@ SST_YES_B = {"A": "no, the review is negative", "B": "yes, the review is positiv
 BQ_YES_A = {"A": "yes", "B": "no"}
 BQ_YES_B = {"A": "no", "B": "yes"}
 
-try:
-    ag = load_dataset("fancyzhx/ag_news", split="test")
-except Exception:
-    ag = load_dataset("ag_news", split="test")
-emo = load_dataset("dair-ai/emotion", split="test")
-sst = load_dataset("stanfordnlp/sst2", split="validation")
-bq = load_dataset("google/boolq", split="validation")
+_ITEMS = {}
 
-def sample(n_total, n):
-    return [int(i) for i in np.random.default_rng(SEED).choice(n_total, n, replace=False)]
-
-AG_ITEMS = [(i, ag[i]["text"], AG_LABELS[ag[i]["label"]]) for i in sample(len(ag), N_AG)]
-EMO_ITEMS = [(i, emo[i]["text"], EMO_LABELS[emo[i]["label"]]) for i in sample(len(emo), N_EMO)]
-SST_ITEMS = [(i, sst[i]["sentence"], bool(sst[i]["label"] == 1)) for i in range(len(sst))]
-BQ_ITEMS = [(i, bq[i]["passage"], bq[i]["question"].strip().capitalize() + "?", bool(bq[i]["answer"]))
-            for i in sample(len(bq), N_BOOLQ)]
+def items(name):
+    """Load dataset items only when an experiment actually has to be run."""
+    if name not in _ITEMS:
+        from datasets import load_dataset
+        rng_sample = lambda n_total, n: [int(i) for i in np.random.default_rng(SEED).choice(n_total, n, replace=False)]
+        if name == "ag":
+            try:
+                ag = load_dataset("fancyzhx/ag_news", split="test")
+            except Exception:
+                ag = load_dataset("ag_news", split="test")
+            _ITEMS[name] = [(i, ag[i]["text"], AG_LABELS[ag[i]["label"]]) for i in rng_sample(len(ag), N_AG)]
+        elif name == "emo":
+            emo = load_dataset("dair-ai/emotion", split="test")
+            _ITEMS[name] = [(i, emo[i]["text"], EMO_LABELS[emo[i]["label"]]) for i in rng_sample(len(emo), N_EMO)]
+        elif name == "sst":
+            sst = load_dataset("stanfordnlp/sst2", split="validation")
+            _ITEMS[name] = [(i, sst[i]["sentence"], bool(sst[i]["label"] == 1)) for i in range(len(sst))]
+        elif name == "boolq":
+            bq = load_dataset("google/boolq", split="validation")
+            _ITEMS[name] = [(i, bq[i]["passage"], bq[i]["question"].strip().capitalize() + "?", bool(bq[i]["answer"]))
+                            for i in rng_sample(len(bq), N_BOOLQ)]
+    return _ITEMS[name]
 
 def key_schemes(labels):
     n = len(labels)
@@ -236,7 +259,7 @@ def run_keys(items, labels, desc, instr, ckpt, tag):
 
 def run_sst2(ckpt):
     recs = []
-    for iid, text, pos in tqdm(SST_ITEMS, desc=f"{ckpt} sst2"):
+    for iid, text, pos in tqdm(items("sst"), desc=f"{ckpt} sst2"):
         recs.append({"id": iid, "pos": pos,
                      "noul_pos": ask_noul(text, "Is this review positive?", ckpt),
                      "noul_neg": ask_noul(text, "Is this review negative?", ckpt),
@@ -254,7 +277,7 @@ def run_sst2_cf(ckpt):
 
 def run_boolq(ckpt):
     recs = []
-    for iid, passage, q, ans in tqdm(BQ_ITEMS, desc=f"{ckpt} boolq"):
+    for iid, passage, q, ans in tqdm(items("boolq"), desc=f"{ckpt} boolq"):
         recs.append({"id": iid, "gold": ans,
                      "noul": ask_noul(passage, q, ckpt),
                      "choice_yesA": ask_choice(passage, BQ_YES_A, q, ckpt)[1]["A"],
@@ -434,29 +457,30 @@ def analyze_boolq(rows, ckpt):
     return out
 
 # ============================== run everything ==============================
-S = {"env": ENV, "rounding_patch_active": PATCH_OK}
+S = {}
 results_text = {}
 for ckpt in CHECKPOINTS:
     print(f"\n>>> running checkpoint: {ckpt}")
     S[ckpt] = {"raw": {
         "ag_pos": cached(f"{ckpt}_ag_position",
-                         lambda: run_position(AG_ITEMS, AG_LABELS, AG_DESC, AG_INSTR, ckpt, True, "ag")),
+                         lambda: run_position(items("ag"), AG_LABELS, AG_DESC, AG_INSTR, ckpt, True, "ag")),
         "emo_pos": cached(f"{ckpt}_emo_position",
-                          lambda: run_position(EMO_ITEMS, EMO_LABELS, EMO_DESC, EMO_INSTR, ckpt, False, "emo")),
+                          lambda: run_position(items("emo"), EMO_LABELS, EMO_DESC, EMO_INSTR, ckpt, False, "emo")),
         "ag_keys": cached(f"{ckpt}_ag_keys",
-                          lambda: run_keys(AG_ITEMS, AG_LABELS, AG_DESC, AG_INSTR, ckpt, "ag")),
+                          lambda: run_keys(items("ag"), AG_LABELS, AG_DESC, AG_INSTR, ckpt, "ag")),
         "emo_keys": cached(f"{ckpt}_emo_keys",
-                           lambda: run_keys(EMO_ITEMS, EMO_LABELS, EMO_DESC, EMO_INSTR, ckpt, "emo")),
+                           lambda: run_keys(items("emo"), EMO_LABELS, EMO_DESC, EMO_INSTR, ckpt, "emo")),
         "sst2": cached(f"{ckpt}_sst2", lambda: run_sst2(ckpt)),
         "sst2_cf": cached(f"{ckpt}_sst2_cf", lambda: run_sst2_cf(ckpt)),
         "boolq": cached(f"{ckpt}_boolq", lambda: run_boolq(ckpt)),
     }}
 
+S["env"], S["rounding_patch_active"] = ENV, PATCH_OK
 print("\n\n" + "=" * 30 + " BEGIN RESULTS " + "=" * 30 + "\n")
 print(f"Environment: {ENV}")
 print(f"Rounding patch active: {PATCH_OK}")
 print(f"Samples: AG News {N_AG} (all 24 orderings), Emotion {N_EMO} ({N_EMO_PERMS} random orderings), "
-      f"SST-2 {len(SST_ITEMS)}, BoolQ {N_BOOLQ}; seed={SEED}, bootstrap={N_BOOT}\n")
+      f"SST-2 {N_SST}, BoolQ {N_BOOLQ}; seed={SEED}, bootstrap={N_BOOT}\n")
 
 for ckpt in CHECKPOINTS:
     raw = S[ckpt].pop("raw")
